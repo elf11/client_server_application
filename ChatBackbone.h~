@@ -1,0 +1,36 @@
+#ifndef CHAT_BACKBONE_H_
+#define CHAT_BACKBONE_H_
+
+#include <sys/types.h>
+#include <list>
+#include "commons.h"
+
+// A user's struct and a pointer to it
+struct user;
+typedef struct user * User;
+
+// Main Chat Server class
+class ChatBackbone {
+    protected:
+        int sockfd, portno;
+        fd_set read_fds;    //fd_set folosit in select()
+        std::list<User> users;
+        int fdmax; // nr maxim al unui fd
+
+    public:
+        ChatBackbone();
+        ~ChatBackbone();
+
+        //void setupServer();
+        //void run();
+        //void handle_new_connection();
+        //bool handle_client_msg(User crt_user, int usr_sockfd);
+        void connectToServer(int &sockfd, const struct sockaddr_in &serv_addr);
+        void addReadFD(int fd);
+        User findUser(const char *name);
+        void printList();
+        void error(const char *msg);
+        void trim_endl(char *string, int len);
+};
+
+#endif /*CHAT_BACKBONE_H_*/

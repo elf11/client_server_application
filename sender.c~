@@ -1,0 +1,297 @@
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kermit.h"
+#include "alarm.h"
+#include "crc.h"
+
+// Niste variabile globale
+static word *tabel;
+static struct settings me, you;
+
+// O constanta definita in alt fisier
+extern const unsigned char mark;
+
+static void send_file_data(int fd_out, int fd_in, int file, unsigned char *ptr_seq);
+// nou record personal de lungime a definitiei unei functii
+static void set_hf_send_packet(int fd_out, int fd_in, unsigned char buffer[],
+                unsigned char len, unsigned char *seq, unsigned char type,
+                unsigned char response[], int *response_length);
+static void send_packet(int fd_out, int fd2, unsigned char buffer[], int buffer_length,
+            unsigned char response[], int *response_length);
+
+
+// Functia principala (cea care realizeaza transferul tuturor fisierelor)
+void kermit_send(int fd_out, int fd_in, char *file_list[], int list_size) {
+    unsigned char buffer[0x64], response[0x64];
+    unsigned char len, seq;
+    int i, file, response_length;
+    char *ptr;
+
+    // Initializez tabelul CRC-ului
+    tabel = tabelcrc(CRCCCITT);
+
+    // Initializarea nr de secventa al pachetelor
+    seq = 0;
+
+    // Initializarea alarmei
+    init_alarm();
+
+    // Setarile senderului
+    me.maxl = 79;
+    me.time = 3;
+    me.npad = 0;
+    me.padc = 0x00;
+    me.eol = '\r';
+    me.qctl = '#';
+    me.qbin = '&';
+    me.chkt = '1';
+    me.rept = '~';
+
+    // Setez lungimea si campul de date ale pachetului
+    len = 9 + 4;
+    set_settings(buffer, me);
+
+    // Trimit pachetul SEND_INIT
+    set_hf_send_packet(fd_out, fd_in, buffer, len, &seq, 'S', response, &response_length);
+
+    // Preiau setarile receiverului
+    get_settings(response, &you);
+
+    // Trimit toate fisierele primite ca parametru
+    for(i = 0; i < list_size; i++) {
+        // Deschid al "i"-lea fisier
+        file = open(file_list[i], O_RDONLY);
+
+        // Verific daca fisierul a fost deschis cu succes
+        if(file == -1) {
+            // Daca nu, afisez un mesaj de eroare, si trec la urmatorul fisier
+            fprintf(stderr, "sender: the file %s could not be opened\n", file_list[i]);
+            continue;
+        }
+
+        // Extrag doar numele fisierului dintr-o cale "Unix"
+        ptr = strrchr(file_list[i], '/');
+
+        // Construiesc si trimit pachetul cu numele fisierului
+        if(ptr == NULL) {
+            len = strlen(file_list[i]);
+            memcpy(buffer + 4, file_list[i], len);
+        } else {
+            len = strlen(ptr + 1);
+            memcpy(buffer + 4, ptr + 1, len);
+        }
+        len += 4;
+        set_hf_send_packet(fd_out, fd_in, buffer, len, &seq, 'F', response, &response_length);
+
+        // Afisez un mesaj pt lumea exterioara
+        fprintf(stderr, "sender: sending file %s\n", file_list[i]);
+
+        // Trimit tot continutul fisierului catre receiver
+        send_file_data(fd_out, fd_in, file, &seq);
+
+        // Trimit pachetul de EOF
+        len = 4;
+        set_hf_send_packet(fd_out, fd_in, buffer, len, &seq, 'Z', response, &response_length);
+
+        // Inchid fisierul
+        close(file);
+    }
+
+    // Trimit pachetul de EOT
+    len = 4;
+    set_hf_send_packet(fd_out, fd_in, buffer, len, &seq, 'B', response, &response_length);
+
+    // Eliberez memoria folosita de tabela CRC
+    free(tabel);
+}
+
+
+// Aceasta functie trimite toate datele aflate intr-un fisier (cu descriptorul "file")
+static void send_file_data(int fd_out, int fd_in, int file, unsigned char *ptr_seq) {
+    unsigned char buffer[0x64], response[0x64];
+    unsigned char len, seq, times, coded[200];
+    unsigned int current_character, previous_character;
+    int i, k, previous_position, response_length;
+
+    // Numarul de secventa curent
+    seq = *ptr_seq;
+
+    // Pozitia curenta & precedenta
+    k = previous_position = 0;
+
+    // Ultimul caracter citit e by default 0
+    current_character = 0;
+
+    // Precedentul caracter citit e by default MY_EOF
+    // (conteaza foarte mult ca previous_character != current_character)
+    previous_character = MY_EOF;
+
+    // Numarul de aparitii ale caracterului precedent
+    times = 0;
+
+    // Resetez citirea din fisier cu buffer personalizat
+    getchar_with_buffer(FILE_BUFFER_RESET);
+
+    // Execut aceasta bucla pana cand citesc MY_EOF
+    do {
+        // Citesc un nou caracter din fisier
+        current_character = getchar_with_buffer(file);
+
+        // Verific daca acesta coincide cu ultimul caracter citit
+        if(current_character == previous_character && times < 94) {
+            // Daca da, cresc numarul de aparitii ale caracterului
+            times++;
+        } else {
+            // Altfel, codific caracterul precedent
+
+            // Daca numarul de aparitii e sub o limita...
+            if(times <= DONT_COMPRESS_THRESHOLD) {
+                // Scriu caracterul in forma necomprimata
+                for(i = 0; i < times; i++)
+                    encode_single_char(me, coded, &k, previous_character);
+            } else { // Altfel folosesc compresia cu tilda
+                coded[k++] = '~';
+                coded[k++] = tochar(times);
+                encode_single_char(me, coded, &k, previous_character);
+            }
+
+            // Updatez valoarea ultimului caracter citit
+            previous_character = current_character;
+            // Acest caracter apare o data
+            times = 1;
+        }
+
+        // Daca caracterele codate pana acum depasesc limita maxima a campului de date,
+        // trimit pe teava toate caracterele codate mai putin ultimul
+        if(k > me.maxl - 4) {
+            // Setez lungimea & campul de date ale pachetului
+            len = previous_position + 4;
+            for(i = 0; i < previous_position; i++)
+                buffer[i+4] = coded[i];
+
+            // Trimit pachetul de DATE
+            set_hf_send_packet(fd_out, fd_in, buffer, len, &seq, 'D', response, &response_length);
+
+            // Reglez bufferul de caractere codate pentru a le
+            // elimina pe cele de-abia scrise in fisier
+            k -= previous_position;
+            for(i = 0; i < k; i++)
+                coded[i] = coded[i + previous_position];
+        }
+
+        // Setez noua pozitie precedenta
+        previous_position = k;
+    } while(current_character != (unsigned int) MY_EOF);
+
+    // Daca au mai ramas caractere codate netrimise...
+    if(k) {
+        // Setez lungimea & campul de date ale pachetului
+        len = k + 4;
+        for(i = 0; i < k; i++)
+            buffer[i+4] = coded[i];
+
+        // Trimit pachetul de DATE
+        set_hf_send_packet(fd_out, fd_in, buffer, len, &seq, 'D', response, &response_length);
+    }
+
+    // Setez nr de secventa pentru a fi vizibil si functiei apelante
+    *ptr_seq = seq;
+}
+
+
+// Functia care ia un pachet care are partea de date deja completata,
+// ii pune header, crc si il trimite frumos la destinatie
+static void set_hf_send_packet(int fd_out, int fd_in, unsigned char buffer[], unsigned char len, unsigned char *seq, unsigned char type, unsigned char response[], int *response_length) {
+    // Setez header-ul pachetului (lungime, nr secventa, tip)
+    set_packet_header(buffer, len, *seq, type);
+
+    // Calculez CRC-ul
+    crc_packet(tabel, buffer, len);
+
+    // Trimit pachetul
+    send_packet(fd_out, fd_in, buffer, len + 2, response, response_length);
+
+    // Incrementez nr secventa
+    increment_counter(seq);
+}
+
+
+// Functia de trimitere a unui singur pachet
+// - "fd_out" & "fd_in" sunt file descriptors pentru pipe-urile de iesire/intrare
+// - "buffer" & "buffer_length" reprezinta bufferul in care este stocat pachetul ce va fi trimis
+// - "received" & "received_length" reprezinta bufferul in care va fi stocat pachetul primit
+static void send_packet(int fd_out, int fd2, unsigned char buffer[], int buffer_length, unsigned char response[], int *response_length) {
+    int i, bytes_read, bytes_written;
+    unsigned char len, seq;
+    const int *was_timeout;
+
+    // Determin numarul de secventa al pachetului
+    seq = unchar(buffer[2]);
+
+    // Incerc trimiterea pachetului de cateva ori
+    for(i = 0; i < MAX_RETRIES; i++) {
+        // Scriu pachetul pe pipe-ul de iesire
+        bytes_written = write(fd_out, buffer, buffer_length);
+
+        // Verific daca n-a avut loc o eroare la scrierea-n pipe
+        // Putin probabil, dar fie...
+        if(bytes_written != buffer_length) {
+            // Afisez un mesaj de eroare
+            fprintf(stderr, "sender: error writing packet to pipe (?!?)\n");
+            // si retrimit pachetul...
+            continue;
+        }
+
+        // Setez alarma la TIMEOUT secunde
+        was_timeout = set_alarm(TIMEOUT);
+
+        // Incerc sa citesc pachetul de confirmare al receptorului
+        bytes_read = read(fd2, response, 0x64);
+
+        // Opresc alarma
+        cancel_alarm();
+
+        // Daca SIGALARM a fost transmis in timp ce asteptam pachetul
+        if(*was_timeout) {
+            // Afisez un mesaj de eroare
+            fprintf(stderr, "sender: we timed out while waiting for the ACK to the packet %d\n", seq);
+            // si retrimit pachetul...
+            continue;
+        }
+
+        len = unchar(response[1]);
+
+        // Daca CRC-ul nu e bun...
+        if(!crc_check(tabel, response, len)) {
+            // ...retrimit pachetul
+            fprintf(stderr, "sender: failed CRC check for the ACK/NAK to the packet %d\n", seq);
+            continue;
+        }
+
+        // Daca am primit un ACK pentru pachetul transmis
+        if ( ( response[3] == 'Y' && buffer[2] == response[2] ) ||
+             ( response[3] == 'N' && buffer[2] + 1 == response[2] ) ) {
+            // Setez lungimea raspunsului
+            *response_length = bytes_read;
+            // si ma intorc la origini...
+            return;
+        }
+    }
+
+    // Daca am ajuns aici, inseamna ca am incercat sa trimitem
+    // pachetul de MAX_RETRIES ori, fara a primi vreun ACK
+    fprintf(stderr, "sender: exceeded maximum number of retries... exiting...\n");
+
+    // Inchid pipe-urile
+    close(fd_out);
+    close(fd2);
+
+    // Ies de tot...
+    exit(0);
+}
+

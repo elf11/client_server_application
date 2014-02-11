@@ -1,0 +1,112 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <list>
+#include "ChatBackbone.h"
+
+using namespace std;
+
+// constructor generic
+ChatBackbone::ChatBackbone() {
+    // golim read_fds
+    FD_ZERO(&read_fds);
+    // initial, sa zicem ca fd-ul maxim e 0
+    fdmax = 0;
+}
+
+// destructor generic
+ChatBackbone::~ChatBackbone() {
+    list<User>::iterator iter;
+    User crt_user;
+
+    // iterez prin toti userii
+    for(iter = users.begin(); iter != users.end(); ++iter) {
+        crt_user = *iter;
+        close(crt_user->sockfd);
+        free(crt_user);
+    }
+
+    // inchid socket-ul serverului
+    close(sockfd);
+}
+
+// conectare la server-ul retinut in al doilea parametru
+// in primul parametru se va afla fd-ul socketului
+void ChatBackbone::connectToServer(int &sockfd, const struct sockaddr_in &serv_addr) {
+    // deschid un socket
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0)
+        error("ERROR opening socket");
+
+    // ma conectez la server
+    if (connect(sockfd, (struct sockaddr*) &serv_addr, sizeof(struct sockaddr_in)) < 0)
+        error("ERROR connecting");
+}
+
+// adaug un file descriptor la cele din care citim
+void ChatBackbone::addReadFD(int fd) {
+    // adaug noul fd la lista celor de la care primesc mesaje
+    FD_SET(fd, &read_fds);
+
+    // updatez fdmax daca e cazul
+    if (fd > fdmax) {
+        fdmax = fd;
+    }
+}
+
+// caut un user in lista locala; daca acesta exista,
+// intorc un pointer catre el; altfel, intorc NULL
+User ChatBackbone::findUser(const char *name) {
+    list<User>::iterator iter;
+    User crt_user;
+
+    // parcurg toti utilizatorii conectati la server
+    for(iter = users.begin(); iter != users.end(); ++iter) {
+        // extrag pointerul catre userul curent
+        crt_user = *iter;
+
+        // daca userul s-a autentificat, iar numele sau este identic cu numele
+        // celui cautat, intorc imediat un pointer catre user
+        if(crt_user->auth && strcmp(name, crt_user->info.name) == 0)
+            return crt_user;
+    }
+
+    // altfel intorc NULL (nu exista user cu numele cerut)
+    return NULL;
+}
+
+// printez lista tuturor userilor
+void ChatBackbone::printList() {
+    list<User>::iterator iter;
+    User crt_user;
+
+    for(iter = users.begin(); iter != users.end(); ++iter) {
+        crt_user = *iter;
+
+        if(crt_user->auth) {
+            struct user_info * crt_info = & crt_user->info;
+            printf("%s %s %d\n", crt_info->name, inet_ntoa(crt_info->address), crt_info->port);
+        }
+    }
+}
+
+// Handle some errors
+void ChatBackbone::error(const char *msg) {
+    perror(msg);
+    exit(1);
+}
+
+// Trim some strings
+void ChatBackbone::trim_endl(char *string, int len) {
+    do {
+        --len;
+    } while((len >= 0) && (string[len] == '\n' || string[len] == '\r'));
+
+    string[len + 1] = 0;
+}
+

@@ -1,0 +1,240 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include "kermit.h"
+#include "alarm.h"
+#include "crc.h"
+
+// Niste variabile globale
+static word *tabel;
+static struct settings me, you;
+
+// O constanta definita in alt fisier
+extern const unsigned char mark;
+
+
+static void receive_packet(int fd_out, int fd_in, unsigned char received[], int *received_length, int seq);
+static void send_confirmation(int fd_out, unsigned char seq, unsigned char type);
+
+
+char* kermit_receive(int fd_out, int fd_in, char *down_dir) {
+    char filename[0x74];
+    unsigned char len, seq, data_length;
+    unsigned char received[0x64], buffer[0x64], bytes[5000];
+    int k, bytes_read, received_length, filename_length;
+    int file;
+    char *ret_name = NULL;
+
+    // Initializez tabelul CRC-ului
+    tabel = tabelcrc(CRCCCITT);
+
+    // Initializarea nr de secventa al pachetelor
+    seq = 0;
+
+    // Citesc primul pachet si preiau setarile senderului
+    bytes_read = read(fd_in, received, 0x64);
+    get_settings(received, &you);
+
+    // Setarile receiverului
+    me.maxl = 79;
+    me.time = 3;
+    me.npad = 0;
+    me.padc = 0x00;
+    me.eol = '\r';
+    me.qctl = '#';
+    me.qbin = '&';
+    me.chkt = '1';
+    me.rept = '~';
+
+    // Setez lungimea si campul de date ale pachetului
+    len = 9 + 4;
+    set_settings(buffer, me);
+
+    // Setez headerul & CRC-ul pachetului
+    set_packet_header(buffer, len, seq, 'Y');
+    crc_packet(tabel, buffer, len);
+
+    // Trimit pachetul pe teava
+    if(write(fd_out, buffer, len + 2) != len + 2) {
+        fprintf(stderr, "receiver: error writing packet to pipe (?!?)\n");
+    }
+
+    // Cresc nr de secventa
+    increment_counter(&seq);
+
+    // Initializez file descriptorul
+    file = -1;
+
+    while(1) {
+        // Primesc un pachet de la sender
+        receive_packet(fd_out, fd_in, received, &received_length, seq);
+
+        // Stabilesc ce fac in functie de tipul pachetului
+        switch(received[3]) {
+            // Se transmite un nou fisier
+            case 'F':
+                // Stabilesc lungimea numelui fisierului
+                data_length = unchar(received[1]) - 4;
+
+                // Construiesc noul nume al fisierului
+                strcpy(filename, down_dir);
+                strcat(filename, "/");
+                filename_length = strlen(filename);
+                memcpy(filename + filename_length, received + 4, data_length);
+                filename[filename_length + data_length] = 0;
+
+                // Pentru "return"
+                ret_name = (char*) malloc(0x74);
+                memcpy(ret_name, received + 4, data_length);
+                ret_name[data_length] = 0;
+
+                // Deschid fisierul
+                file = open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+                if(file == -1) {
+                    fprintf(stderr, "receiver: file could not be opened for writing\n");
+                    fprintf(stderr, "receiver: exiting...\n");
+                    close(fd_out);
+                    close(fd_in);
+                    exit(-1);
+                }
+
+                // Afisez un mesaj pt lumea exterioara
+                fprintf(stderr, "receiver: receiving file %s\n", filename);
+                break;
+
+            // Se transmite o bucata de fisier
+            case 'D':
+                // Stabilesc lungimea datelor din pachet
+                data_length = unchar(received[1]) - 4;
+
+                // Decodez datele si le pun in uriasul buffer pe nume "bytes"
+                decode(you, received + 4, data_length, bytes, &k);
+
+                // Iau ce e in buffer si scriu in fisier
+                if(file != -1) {
+                    if(write(file, bytes, k) != k) {
+                        fprintf(stderr, "receiver: error writing in file\n");
+                        exit(-1);
+                    }
+                } else {
+                    fprintf(stderr, "receiver: a file should have been opened first\n");
+                    fprintf(stderr, "receiver: exiting...\n");
+                    close(fd_out);
+                    close(fd_in);
+                    exit(-1);
+                }
+                break;
+
+            // Am primit EOF
+            case 'Z':
+                // Bineinteles, voi inchide fisierul
+                if(file != -1) {
+                    close(file);
+                    file = -1;
+                } else {
+                    fprintf(stderr, "receiver: a file should have been opened first\n");
+                    fprintf(stderr, "receiver: exiting...\n");
+                    close(fd_out);
+                    close(fd_in);
+                    exit(-1);
+                }
+                break;
+
+            // Am primit EOT
+            case 'B':
+                // Goodbye...
+                free(tabel);
+                return ret_name;
+        }
+
+        // Cresc numarul de secventa
+        increment_counter(&seq);
+    }
+
+    return NULL;
+}
+
+
+// Functia de primire a unui singur pachet
+// - "fd_out" & "fd_in" sunt file descriptors pentru pipe-urile de iesire/intrare
+// - "received" & "received_length" reprezinta bufferul in care va fi stocat pachetul primit
+// - "seq" reprezinta numarul de secventa asteptat
+static void receive_packet(int fd_out, int fd_in, unsigned char received[], int *received_length, int seq) {
+    unsigned char len;
+    int i, bytes_read;
+    const int *was_timeout;
+
+    // Astept sa primesc pachetul corect de cateva ori
+    for(i = 0; i < MAX_RETRIES; i++) {
+        // Setez alarma la TIMEOUT secunde
+        was_timeout = set_alarm(TIMEOUT);
+
+        // Incerc sa citesc pachetul trimis de sender
+        bytes_read = read(fd_in, received, 0x64);
+
+        // Opresc alarma
+        cancel_alarm();
+
+        // Daca SIGALARM a fost transmis in timp ce asteptam pachetul
+        if(*was_timeout) {
+            // Afisez un mesaj de eroare
+            fprintf(stderr, "receiver: we timed out while waiting for the packet %d\n", seq);
+            // si astept pachetul din nou...
+            continue;
+        }
+
+        len = unchar(received[1]);
+
+        // Verific daca am primit pachetul pe care il asteptam
+        // (in prealabil verific daca CRC-ul este in regula)
+        if(crc_check(tabel, received, len) && unchar(received[2]) == seq) {
+            // Daca da, trimit ACK
+            send_confirmation(fd_out, seq, 'Y');
+
+            // Setez lungimea pachetului primit pentru a fi vizibila functiei apelante
+            *received_length = bytes_read;
+
+            // Ma intorc...
+            return;
+        } else {
+            // Daca nu, trimit NAK
+            send_confirmation(fd_out, seq, 'N');
+        }
+    }
+
+    // Daca am ajuns aici, inseamna ca am asteptat un
+    // pachet de MAX_RETRIES ori, fara a-l primi
+    fprintf(stderr, "receiver: exceeded maximum number of retries... exiting...\n");
+
+    // Inchid pipe-urile
+    close(fd_out);
+    close(fd_in);
+
+    // Ies de tot din program...
+    exit(0);
+}
+
+
+// Functia de trimitere a confirmarii/infirmarii primirii unui pachet (campul de date va fi vid)
+static void send_confirmation(int fd_out, unsigned char seq, unsigned char type) {
+    unsigned char len, buffer[0x64];
+    int bytes_written;
+
+    // Setez diversii parametri ai pachetului
+    len = 4;
+    set_packet_header(buffer, len, seq, type);
+    crc_packet(tabel, buffer, len);
+
+    // Il trimit catre receiver
+    bytes_written = write(fd_out, buffer, len + 2);
+
+    // Verific daca tot mesajul a putut fi transmis
+    if(bytes_written != len + 2) {
+        fprintf(stderr, "receiver: error writing packet to pipe (?!?)\n");
+    }
+}
+
